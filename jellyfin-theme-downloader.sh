@@ -2,11 +2,9 @@
 # =============================================================================
 # jellyfin-theme-downloader.sh
 #
-# Downloads theme songs from YouTube for every movie and TV show folder,
-# places a theme.mp3 in each one, and normalises volume to EBU R128.
-#
-# Jellyfin will automatically pick up theme.mp3 files and play them
-# when browsing your library (enable in Settings → Display → Theme Music).
+# Automatically downloads theme songs for every movie and TV show in your
+# Jellyfin library. Places a theme.mp3 in each media folder, which Jellyfin
+# picks up natively. All themes are volume-normalised to EBU R128.
 #
 # Requirements:
 #   apt install ffmpeg -y
@@ -15,15 +13,28 @@
 #
 # Usage:
 #   bash jellyfin-theme-downloader.sh
-#
-# Configure the paths below to match your setup before running.
 # =============================================================================
 
-# ── Configure these ──────────────────────────────────────────────────────────
-MOVIES_DIR="/media/movies"   # folder containing movie subdirectories
-TV_DIR="/media/tv"           # folder containing TV show subdirectories
-TRIM_SECONDS=90              # trim downloaded audio to this length (seconds)
-TARGET_LUFS="-14"            # loudness target (EBU R128; -14 matches streaming platforms)
+# ── Configure your media folders ─────────────────────────────────────────────
+#
+# Format: "path/to/folder:search label"
+#
+# The search label is appended to the title when searching YouTube.
+# For example, "movie" produces: "Blade Runner 2049 movie theme song"
+#                "tv show"     : "Severance tv show theme song"
+#                "anime"       : "Frieren anime theme song"
+#
+# Add or remove entries to match your setup. The script processes all of them.
+#
+MEDIA_DIRS=(
+  "/media/movies:movie"
+  "/media/tv:tv show"
+)
+#
+# ── Other settings ────────────────────────────────────────────────────────────
+TRIM_SECONDS=90       # trim downloaded audio to this length (seconds)
+TARGET_LUFS="-14"     # loudness target (EBU R128; -14 matches streaming platforms)
+SEARCH_DELAY=1        # seconds to wait between YouTube searches (avoids rate limiting)
 # ─────────────────────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -124,8 +135,8 @@ idx=0
 
 search_folder() {
   local folder_path="$1"
-  local media_type="$2"
-  local folder_name title search_query
+  local search_label="$2"
+  local folder_name title search_query json vid_title vid_dur
 
   folder_name=$(basename "$folder_path")
 
@@ -134,13 +145,11 @@ search_folder() {
   title=$(clean_title "$folder_name")
   [[ -z "$title" ]] && return
 
-  if [[ "$media_type" == "tv" ]]; then
-    search_query="${title} tv show theme song"
-  else
-    search_query="${title} movie theme song"
-  fi
+  # Final query: "<title> <label> theme song"
+  # e.g. "Blade Runner 2049 movie theme song"
+  #      "Severance tv show theme song"
+  search_query="${title} ${search_label} theme song"
 
-  local json vid_title vid_dur
   json=$(yt-dlp \
     --default-search "ytsearch1" \
     --no-playlist \
@@ -154,12 +163,14 @@ search_folder() {
 
   FOLDER_PATHS[$idx]="$folder_path"
   FOLDER_TITLES[$idx]="$title"
-  FOLDER_TYPES[$idx]="$media_type"
+  FOLDER_TYPES[$idx]="$search_label"
   YT_TITLES[$idx]="${vid_title:-[no result]}"
   YT_DURATIONS[$idx]=$(fmt_duration "$vid_dur")
 
   ((idx++))
   printf "." >&2
+
+  sleep "$SEARCH_DELAY"
 }
 
 # =============================================================================
@@ -173,24 +184,31 @@ echo ""
 
 check_deps
 
-# Validate dirs
-[[ ! -d "$MOVIES_DIR" ]] && echo -e "${YELLOW}Warning: movies dir not found: $MOVIES_DIR${NC}"
-[[ ! -d "$TV_DIR"     ]] && echo -e "${YELLOW}Warning: TV dir not found: $TV_DIR${NC}"
+# Process each configured media directory
+valid=false
+for entry in "${MEDIA_DIRS[@]}"; do
+  dir="${entry%%:*}"
+  label="${entry##*:}"
+  if [[ ! -d "$dir" ]]; then
+    echo -e "${YELLOW}Warning: folder not found, skipping: $dir${NC}"
+    continue
+  fi
+  valid=true
+done
+$valid || { echo -e "${RED}No valid media folders found. Check MEDIA_DIRS in the script.${NC}"; exit 1; }
 
 echo -e "  Searching YouTube for all titles — this may take a few minutes..."
+echo -e "  ${DIM}(${SEARCH_DELAY}s delay between searches to avoid rate limiting)${NC}"
 echo ""
 
-if [[ -d "$MOVIES_DIR" ]]; then
+for entry in "${MEDIA_DIRS[@]}"; do
+  dir="${entry%%:*}"
+  label="${entry##*:}"
+  [[ ! -d "$dir" ]] && continue
   while IFS= read -r -d '' folder; do
-    search_folder "$folder" "movie"
-  done < <(find "$MOVIES_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
-fi
-
-if [[ -d "$TV_DIR" ]]; then
-  while IFS= read -r -d '' folder; do
-    search_folder "$folder" "tv"
-  done < <(find "$TV_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
-fi
+    search_folder "$folder" "$label"
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+done
 
 echo ""
 echo ""
@@ -233,8 +251,8 @@ echo ""
 # =============================================================================
 # Phase 3: ask which to skip
 # =============================================================================
-echo -e "  ${RED}⚠ long${NC}  = probably a full score or documentary, not a theme"
-echo -e "  ${YELLOW}⚠ no result${NC} = nothing found, will be skipped automatically"
+echo -e "  ${RED}⚠ long${NC}      = probably a full score or documentary rather than a theme"
+echo -e "  ${YELLOW}⚠ no result${NC} = nothing found on YouTube, will be skipped automatically"
 echo ""
 echo -e "  Enter ${BOLD}numbers to skip${NC}, space-separated (or press Enter to download all):"
 echo -ne "  > "
@@ -260,28 +278,21 @@ ok=0; skipped=0; failed=0
 for ((i=0; i<total; i++)); do
   title="${FOLDER_TITLES[$i]}"
   folder_path="${FOLDER_PATHS[$i]}"
-  media_type="${FOLDER_TYPES[$i]}"
+  search_label="${FOLDER_TYPES[$i]}"
   theme_file="$folder_path/theme.mp3"
   tmp_file="$folder_path/.theme_tmp"
+  search_query="${title} ${search_label} theme song"
 
-  # Skipped by user
   if [[ -n "${SKIP_SET[$i]}" ]]; then
     echo -e "  ${YELLOW}[SKIP]${NC}  $title"
     ((skipped++))
     continue
   fi
 
-  # No YouTube result
   if [[ "${YT_TITLES[$i]}" == "[no result]" ]]; then
     echo -e "  ${YELLOW}[SKIP]${NC}  $title — no result found"
     ((skipped++))
     continue
-  fi
-
-  if [[ "$media_type" == "tv" ]]; then
-    search_query="${title} tv show theme song"
-  else
-    search_query="${title} movie theme song"
   fi
 
   # Try twice with duration filter (<10 min), then once without as fallback
@@ -330,13 +341,12 @@ for ((i=0; i<total; i++)); do
 
   mv "${tmp_file}.mp3" "$theme_file"
 
-  # Normalise volume
   if normalize_file "$theme_file"; then
     echo -e "  ${GREEN}[OK]${NC}    $title"
     ((ok++))
   else
     echo -e "  ${YELLOW}[WARN]${NC}  $title — downloaded but normalisation failed"
-    ((ok++))  # still counts as success, just not normalised
+    ((ok++))
   fi
 done
 
